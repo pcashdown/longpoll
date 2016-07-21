@@ -1,17 +1,18 @@
 package controllers
 
 import play.api._
-import libs.concurrent.{Redeemable, Promise, Akka}
+import scala.concurrent.{Await, Future, Promise}
+import libs.concurrent.Akka
 import libs.json._
 import play.api.mvc._
 import java.util.concurrent.atomic.AtomicInteger
-import play.api.Play.current
-import util.Random
+import play.api.Play.current  // Needed for Akka.system to compile
+import scala.util.Random
 import akka.actor.{Actor, Props}
-import akka.dispatch.Await
 import akka.pattern.ask
-import akka.util.duration._
+import scala.concurrent.duration._
 import models.Stats
+import scala.concurrent.ExecutionContext.Implicits.global
 
 object Application extends Controller {
 
@@ -31,26 +32,20 @@ object Application extends Controller {
   }
 
   /** To poll for sent messages */
-  def poll(lastMessageId: Int) = Action {
+  def poll(lastMessageId: Int) = Action.async {
     Stats.countRequest()
 
-    val promiseOfMessages = waitForNewMessages(lastMessageId)
-
-    val promiseOfResult = {
-      promiseOfMessages.orTimeout("Timeout", 60000).map { eitherMessagesOrTimeout =>
-        eitherMessagesOrTimeout.fold(
-          messages => Ok(messagesToJson(messages)),
-          timeout => Ok(messagesToJson(List.empty))
-        )
-      }
+    val messagesFuture = waitForNewMessages(lastMessageId)
+    val timeoutFuture = play.api.libs.concurrent.Promise.timeout("Timeout", 60 seconds)
+    Future.firstCompletedOf(Seq(messagesFuture, timeoutFuture)).map {
+      case messages: List[Message] => Ok(messagesToJson(messages))
+      case timeout: String => Ok(messagesToJson(List.empty))
     }
-
-    Async(promiseOfResult)
   }
 
-  private def waitForNewMessages(lastMessageId: Int): Promise[List[Message]] = {
+  private def waitForNewMessages(lastMessageId: Int): Future[List[Message]] = {
     implicit val timeout = akka.util.Timeout(60 seconds) // needed for ask below
-    Await.result(messagingActor.ask(ListenForMessages(rndClientId, lastMessageId)).mapTo[Promise[List[Message]]], 60 seconds)
+    Await.result(messagingActor.ask(ListenForMessages(rndClientId, lastMessageId)).mapTo[Future[List[Message]]], 60 seconds)
   }
 
   private def rndClientId = Random.nextInt(999999).toString()
@@ -80,9 +75,7 @@ case class ListenForMessages(clientId: String, seqId: Int)
 case class BroadcastMessages()
 
 class MessagingActor extends Actor {
-  type MessagesPromise = Promise[List[Message]] with Redeemable[List[Message]]
-
-  case class Member(seqId: Int, promise: MessagesPromise)
+  case class Member(seqId: Int, promise: Promise[List[Message]])
 
   val seqCnt = new AtomicInteger()
   var messages = List[Message]()
@@ -94,7 +87,7 @@ class MessagingActor extends Actor {
         case (key, member) => {
           val newMessagesForMember = messages.filter(msg => msg.seqId > member.seqId)
           if (newMessagesForMember.size > 0) {
-            member.promise.redeem(newMessagesForMember)
+            member.promise.success(newMessagesForMember)
             members -= key
             Logger.info("Broadcasting "+newMessagesForMember.size+" msgs to " + key)
           }
@@ -109,7 +102,7 @@ class MessagingActor extends Actor {
     }
 
     case ListenForMessages(clientId, seqId) => {
-      val member =  Member(seqId, Promise[List[Message]]())
+      val member = Member(seqId, Promise[List[Message]]())
       members = members + (clientId -> member)
 
       Logger.info("Messages requested by clientId="+clientId+" starting from seqId="+seqId)
