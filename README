@@ -8,3 +8,5 @@ second. After a 60 second period with no messages, connections
 will timeout and the client will re-connect again.
 
 The long polling connections should not tie up threads in the application.
+
+Updated by pcashdown to Play: 2.5.0, Akka: 2.4.8, Scala: 2.11.7, SBT: 0.13.11, on 7/21/2016
